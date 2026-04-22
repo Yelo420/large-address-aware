@@ -1,0 +1,169 @@
+name: Windows Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - CHANGELOG.md
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch git tags
+        run: git fetch --force --tags origin
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $releaseHeading = Get-Content 'CHANGELOG.md' | Where-Object { $_ -match '^## \[' } | Select-Object -First 1
+
+          if (-not $releaseHeading) {
+            throw 'No version heading found in CHANGELOG.md. Expected a section like ## [1.2.3].'
+          }
+
+          $versionStart = $releaseHeading.IndexOf('[')
+          $versionEnd = $releaseHeading.IndexOf(']', $versionStart + 1)
+
+          if ($versionStart -lt 0 -or $versionEnd -le $versionStart) {
+            throw "Unsupported CHANGELOG heading format: $releaseHeading"
+          }
+
+          $version = $releaseHeading.Substring($versionStart + 1, $versionEnd - $versionStart - 1)
+
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Unsupported CHANGELOG version: $version"
+          }
+
+          $tag = "v$version"
+          $artifactName = "laa-windows-$tag"
+
+            $existingTag = git tag -l $tag | Select-Object -First 1
+
+            if ($existingTag -eq $tag) {
+            Write-Host "Tag $tag already exists; skipping release publication."
+            $shouldPublishRelease = 'false'
+          } else {
+            $shouldPublishRelease = 'true'
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "should_publish_release=$shouldPublishRelease" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Flutter
+        if: steps.meta.outputs.should_publish_release == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        if: steps.meta.outputs.should_publish_release == 'true'
+        run: flutter config --enable-windows-desktop
+
+      - name: Install dependencies
+        if: steps.meta.outputs.should_publish_release == 'true'
+        run: flutter pub get
+
+      - name: Run tests
+        if: steps.meta.outputs.should_publish_release == 'true'
+        run: flutter test
+
+      - name: Analyze project
+        if: steps.meta.outputs.should_publish_release == 'true'
+        run: flutter analyze
+
+      - name: Build Windows release
+        if: steps.meta.outputs.should_publish_release == 'true'
+        run: flutter build windows --release
+
+      - name: Archive Windows release
+        if: steps.meta.outputs.should_publish_release == 'true'
+        id: archive
+        shell: pwsh
+        run: |
+          $stagingDir = Join-Path $env:RUNNER_TEMP '${{ steps.meta.outputs.artifact_name }}'
+          $zipPath = Join-Path $env:RUNNER_TEMP '${{ steps.meta.outputs.artifact_name }}.zip'
+
+          if (Test-Path $stagingDir) {
+            Remove-Item $stagingDir -Recurse -Force
+          }
+
+          New-Item -Path $stagingDir -ItemType Directory | Out-Null
+          Copy-Item 'build/windows/x64/runner/Release/*' $stagingDir -Recurse -Force
+          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $zipPath -Force
+
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        if: steps.meta.outputs.should_publish_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: ${{ steps.archive.outputs.zip_path }}
+
+      - name: Extract release notes from changelog
+        if: steps.meta.outputs.should_publish_release == 'true'
+        id: notes
+        shell: pwsh
+        run: |
+          $version = '${{ steps.meta.outputs.version }}'
+          $pattern = '^## \[' + [regex]::Escape($version) + '\](?:\s+-\s+.+)?$'
+          $lines = Get-Content 'CHANGELOG.md'
+          $capture = $false
+          $section = New-Object System.Collections.Generic.List[string]
+
+          foreach ($line in $lines) {
+            if ($line -match '^## \[') {
+              if ($line -match $pattern) {
+                $capture = $true
+              } elseif ($capture) {
+                break
+              }
+            }
+
+            if ($capture) {
+              $section.Add($line)
+            }
+          }
+
+          if ($section.Count -eq 0) {
+            throw "No CHANGELOG entry found for version $version."
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $section | Set-Content $notesPath
+          "path=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create release tag
+        if: steps.meta.outputs.should_publish_release == 'true'
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag '${{ steps.meta.outputs.tag }}'
+          git push origin '${{ steps.meta.outputs.tag }}'
+
+      - name: Publish GitHub release
+        if: steps.meta.outputs.should_publish_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Large Address Aware ${{ steps.meta.outputs.version }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: ${{ steps.archive.outputs.zip_path }}
